@@ -36,11 +36,11 @@ class Image:
 
     def __init__(
             self, image,
-            windspeed_source='NLDAS',
-            ea_source='NLDAS',
-            rs_source='NLDAS',
-            LWin_source='NLDAS',
-            ta_source='NLDAS',
+            windspeed_source='ERA5',
+            ea_source='ERA5',
+            rs_source='ERA5',
+            LWin_source='ERA5',
+            ta_source='ERA5',
             topt_source='projects/openet/assets/ptjpl/ancillary/Topt_from_max_convolved',
             faparmax_source='projects/openet/assets/ptjpl/ancillary/fAPARmax',
             latitude=None,
@@ -452,6 +452,34 @@ class Image:
             LWin = ee.Image(self.LWin_source)
         elif self.LWin_source.upper() == 'NLDAS':
             LWin = self.nldas_interpolate('longwave_radiation', self._date)
+        elif self.LWin_source.upper() == 'ERA5':
+            #LWin = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')\
+                    #.filterDate(ee.Date(self._date),ee.Date(self._date).advance(1,'hour'))\
+                    #.select("surface_thermal_radiation_downwards")\
+                    #.mean()\
+                    #.divide(1*60*60)
+            tak = self.era5_interpolate('temperature_2m', self._date)
+
+              # Actual vapour pressure [kPa]
+            ea_img = tak.expression(
+            '0.6108 * (exp((17.27 * tdew) / (tdew + 237.3)))',{
+            'tdew': tak.subtract(273.15)})
+                
+            eta = ea_img.divide(tak).multiply(0.465)
+            
+            atm_emiss = eta.expression(
+                '1 - (1 + eta1) * exp(-sqrt(1.2 + 3 * eta1))',
+                    {'eta1': eta}
+                )
+                
+            LWin = tak.expression(
+                'atm_emiss*CTE_STE_BOTZ*tair**4',{
+                'tair':tak,
+                'atm_emiss':atm_emiss,
+                'CTE_STE_BOTZ':5.67036713e-8
+                }
+                )
+        
         else:
             raise ValueError(f'Unsupported LWin source: {self.LWin_source}\n')
 
@@ -514,6 +542,15 @@ class Image:
                 "sqrt(wind_u ** 2 + wind_v ** 2)",
                 {"wind_u": wind_u, "wind_v": wind_v}
             )
+
+        elif self.windspeed_source.upper() == 'ERA5':
+            wind_u = self.era5_interpolate('u_component_of_wind_10m', self._date)
+            wind_v = self.era5_interpolate('v_component_of_wind_10m', self._date)
+            windspeed_img = wind_u.expression(
+                "sqrt(wind_u ** 2 + wind_v ** 2)",
+                {"wind_u": wind_u, "wind_v": wind_v}
+            )
+
         else:
             raise ValueError(f'Invalid windspeed_source: {self.windspeed_source}\n')
 
@@ -695,6 +732,17 @@ class Image:
             # Compute Ea from sph (and pair) and convert kPa to Pa
             ea_img = sph_img.multiply(0.378).add(0.622).pow(-1) \
                 .multiply(sph_img).multiply(pair_img)
+
+        elif self.ea_source.upper() == 'ERA5':
+            
+            #tair_img = self.era5_interpolate('temperature_2m', self._date)
+
+            tdew_img = self.era5_interpolate('dewpoint_temperature_2m', self._date)
+
+              # Actual vapour pressure [kPa]
+            ea_img = tdew_img.expression(
+            '0.6108 * (exp((17.27 * tdew) / (tdew + 237.3)))',{
+            'tdew': tdew_img.subtract(273.15)})
         else:
             raise ValueError(f'Unsupported ea_source: {self.ea_source}\n')
 
@@ -708,7 +756,11 @@ class Image:
     @lazy_property
     def Ea_kPa(self):
         """Actual vapor pressure (kilopascal)"""
-        return self.Ea_Pa.divide(1000.0).rename(['Ea_kPa']).set(self._properties)
+
+        if self.ea_source.upper() == 'NLDAS':
+            return self.Ea_Pa.divide(1000.0).rename(['Ea_kPa']).set(self._properties)
+        elif self.ea_source.upper() == 'ERA5':
+            return self.Ea_Pa.rename(['Ea_kPa']).set(self._properties)
 
     @lazy_property
     def rs(self):
@@ -730,6 +782,14 @@ class Image:
             rs_img = ee.Image(self.rs_source)
         elif self.rs_source.upper() == 'NLDAS':
             rs_img = self.nldas_interpolate('shortwave_radiation', self._date)
+        elif self.rs_source.upper() == 'ERA5':
+            rs_img = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')\
+                    .filterDate(ee.Date(self._date),ee.Date(self._date).advance(1,'hour'))\
+                    .select("surface_solar_radiation_downwards_hourly")\
+                    .mean()\
+                    .divide(1*60*60)
+          
+        
         else:
             raise ValueError(f'Unsupported rs_source: {self.rs_source}\n')
 
@@ -755,6 +815,9 @@ class Image:
             ta_img = ee.Image(self.ta_source)
         elif self.ta_source.upper() == 'NLDAS':
             ta_img = self.nldas_interpolate('temperature', self._date).add(273.15)
+        elif self.ta_source.upper() == 'ERA5':
+            ta_img = self.era5_interpolate('temperature_2m', self._date)        
+        
         else:
             raise ValueError(f'Unsupported ta_source: {self.ta_source}\n')
 
@@ -807,6 +870,54 @@ class Image:
             output_img = ee.Image(output_coll.first())
 
         return output_img
+
+    @staticmethod
+    def era5_interpolate(band_name, interp_date, interp_flag=True):
+        """
+        Parameters
+        ----------
+        band_name : str
+        interp_date : ee.Date
+        interp_flag : bool
+
+        Returns
+        -------
+        ee.Image
+
+        Notes
+        -----
+        Interpolate rs hourly image at image time
+        Hourly Rs is time average so time starts are 30 minutes early
+        Move image time 30 minutes earlier to simplify filtering/interpolation
+
+        """
+        era5_coll = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY').select([band_name])
+
+        if interp_flag:
+            # Interpolate
+            previous_time = ee.Number(interp_date.millis()).subtract(1*60*60*1000)
+            next_time = ee.Number(interp_date.millis()).add(1*60*60*1000) 
+
+            prev_img = ee.Image(era5_coll.filterDate(
+                previous_time, interp_date).first())
+            next_img = ee.Image(era5_coll.filterDate(
+                interp_date, next_time).first())
+
+            prev_time = ee.Number(prev_img.get('system:time_start'))
+            next_time = ee.Number(next_img.get('system:time_start'))
+
+            interp_time = interp_date.millis().subtract(prev_time) \
+                .divide(next_time.subtract(prev_time))
+
+            output_img = next_img.subtract(prev_img).multiply(interp_time).add(prev_img)
+        else:
+            # Select the first NLDAS image after the image date
+            output_coll = ee.ImageCollection(era5_coll) \
+                .filterDate(interp_date, interp_date.advance(1, 'hour'))
+
+            output_img = ee.Image(output_coll.first())
+
+        return output_img       
 
     @lazy_property
     def Ta_K(self):
