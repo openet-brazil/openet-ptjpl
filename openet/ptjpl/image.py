@@ -287,8 +287,10 @@ class Image:
         if self.et_reference_factor:
             et_reference_img = et_reference_img.multiply(self.et_reference_factor)
 
-        return self.NDVI.multiply(0).add(et_reference_img) \
-            .rename(['et_reference']).set(self._properties)
+        # TODO: image returning Masked when multiply with NDVI(proj?) (LL)
+        # self.NDVI.multiply(0).add(et_reference_img) \
+        return self.NDVI.mask().multiply(et_reference_img)\
+            .rename(['et_reference']).set(self._properties) 
 
     @lazy_property
     def mask(self):
